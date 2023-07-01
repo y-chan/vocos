@@ -1,8 +1,10 @@
+from typing import Optional
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+from stft import ISTFTHead
 from utils import init_weights, get_padding
 
 LRELU_SLOPE = 0.1
@@ -72,57 +74,71 @@ class ResBlock2(torch.nn.Module):
             remove_weight_norm(l)
 
 
-class Generator(torch.nn.Module):
-    def __init__(self, h):
-        super(Generator, self).__init__()
-        self.h = h
-        self.num_kernels = len(h.resblock_kernel_sizes)
-        self.num_upsamples = len(h.upsample_rates)
-        self.conv_pre = weight_norm(Conv1d(80, h.upsample_initial_channel, 7, 1, padding=3))
-        resblock = ResBlock1 if h.resblock == '1' else ResBlock2
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt Block adapted from https://github.com/facebookresearch/ConvNeXt to 1D audio signal.
 
-        self.ups = nn.ModuleList()
-        for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
-            self.ups.append(weight_norm(
-                ConvTranspose1d(h.upsample_initial_channel//(2**i), h.upsample_initial_channel//(2**(i+1)),
-                                k, u, padding=(k-u)//2)))
+    Args:
+        dim (int): Number of input channels.
+        intermediate_dim (int): Dimensionality of the intermediate layer.
+    """
 
-        self.resblocks = nn.ModuleList()
-        for i in range(len(self.ups)):
-            ch = h.upsample_initial_channel//(2**(i+1))
-            for j, (k, d) in enumerate(zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes)):
-                self.resblocks.append(resblock(h, ch, k, d))
+    def __init__(
+        self,
+        dim: int,
+        intermediate_dim: int,
+    ):
+        super().__init__()
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, intermediate_dim)  # pointwise/1x1 convs, implemented with linear layers
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(intermediate_dim, dim)
 
-        self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, padding=3))
-        self.ups.apply(init_weights)
-        self.conv_post.apply(init_weights)
 
-    def forward(self, x):
-        x = self.conv_pre(x)
-        for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, LRELU_SLOPE)
-            x = self.ups[i](x)
-            xs = None
-            for j in range(self.num_kernels):
-                if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x)
-                else:
-                    xs += self.resblocks[i*self.num_kernels+j](x)
-            x = xs / self.num_kernels
-        x = F.leaky_relu(x)
-        x = self.conv_post(x)
-        x = torch.tanh(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dwconv(x)
+        x = x.transpose(1, 2)  # (B, C, T) -> (B, T, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = x.transpose(1, 2)  # (B, T, C) -> (B, C, T)
 
+        x = residual + x
         return x
 
-    def remove_weight_norm(self):
-        print('Removing weight norm...')
-        for l in self.ups:
-            remove_weight_norm(l)
-        for l in self.resblocks:
-            l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
+
+class Generator(torch.nn.Module):
+    def __init__(self, h, onnx=False):
+        super(Generator, self).__init__()
+        self.h = h
+
+        self.conv_pre = weight_norm(Conv1d(h.num_mels, h.dim, 7, 1, padding=3))
+        self.norm = nn.LayerNorm(h.dim, eps=1e-6)
+
+        self.convnext = nn.ModuleList(
+            [
+                ConvNeXtBlock(
+                    dim=h.dim,
+                    intermediate_dim=h.intermediate_dim,
+                )
+                for _ in range(h.num_layers)
+            ]
+        )
+        self.final_layer_norm = nn.LayerNorm(h.dim, eps=1e-6)
+        self.head = ISTFTHead(h.dim, h.n_fft, h.hop_size, padding=h.padding, onnx=onnx)
+        self.apply(init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embed(x)
+        x = self.norm(x.transpose(1, 2))
+        x = x.transpose(1, 2)
+        for conv_block in self.convnext:
+            x = conv_block(x)
+        x = self.final_layer_norm(x.transpose(1, 2))
+        x = self.head(x)
+        return x
 
 
 class DiscriminatorP(torch.nn.Module):
@@ -188,23 +204,31 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 
-class DiscriminatorS(torch.nn.Module):
-    def __init__(self, use_spectral_norm=False):
-        super(DiscriminatorS, self).__init__()
+class DiscriminatorR(nn.Module):
+    """from univnet"""
+    def __init__(self, n_fft: int, hop_length: int, win_length: int, use_spectral_norm=False):
+        super(DiscriminatorR, self).__init__()
+
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+
         norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+
         self.convs = nn.ModuleList([
-            norm_f(Conv1d(1, 128, 15, 1, padding=7)),
-            norm_f(Conv1d(128, 128, 41, 2, groups=4, padding=20)),
-            norm_f(Conv1d(128, 256, 41, 2, groups=16, padding=20)),
-            norm_f(Conv1d(256, 512, 41, 4, groups=16, padding=20)),
-            norm_f(Conv1d(512, 1024, 41, 4, groups=16, padding=20)),
-            norm_f(Conv1d(1024, 1024, 41, 1, groups=16, padding=20)),
-            norm_f(Conv1d(1024, 1024, 5, 1, padding=2)),
+            norm_f(nn.Conv2d(1, 32, (3, 9), padding=(1, 4))),
+            norm_f(nn.Conv2d(32, 32, (3, 9), stride=(1, 2), padding=(1, 4))),
+            norm_f(nn.Conv2d(32, 32, (3, 9), stride=(1, 2), padding=(1, 4))),
+            norm_f(nn.Conv2d(32, 32, (3, 9), stride=(1, 2), padding=(1, 4))),
+            norm_f(nn.Conv2d(32, 32, (3, 3), padding=(1, 1))),
         ])
-        self.conv_post = norm_f(Conv1d(1024, 1, 3, 1, padding=1))
+        self.conv_post = norm_f(nn.Conv2d(32, 1, (3, 3), padding=(1, 1)))
 
     def forward(self, x):
         fmap = []
+
+        x = self.spectrogram(x)
+        x = x.unsqueeze(1)
         for l in self.convs:
             x = l(x)
             x = F.leaky_relu(x, LRELU_SLOPE)
@@ -215,69 +239,38 @@ class DiscriminatorS(torch.nn.Module):
 
         return x, fmap
 
+    def spectrogram(self, x):
+        x = F.pad(x, (int((self.n_fft - self.hop_length) / 2), int((self.n_fft - self.hop_length) / 2)), mode='reflect')
+        x = x.squeeze(1)
+        x = torch.stft(
+            x, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length, center=False, return_complex=True
+        )  # [B, F, TT]
+        x = torch.view_as_real(x)  # [B, F, TT, 2]
+        mag = torch.norm(x, p=2, dim=-1)  # [B, F, TT]
 
-class MultiScaleDiscriminator(torch.nn.Module):
+        return mag
+
+
+class MultiResolutionDiscriminator(nn.Module):
     def __init__(self):
-        super(MultiScaleDiscriminator, self).__init__()
+        super(MultiResolutionDiscriminator, self).__init__()
         self.discriminators = nn.ModuleList([
-            DiscriminatorS(use_spectral_norm=True),
-            DiscriminatorS(),
-            DiscriminatorS(),
-        ])
-        self.meanpools = nn.ModuleList([
-            AvgPool1d(4, 2, padding=2),
-            AvgPool1d(4, 2, padding=2)
+            DiscriminatorR(1024, 120, 600),
+            DiscriminatorR(2048, 240, 1200),
+            DiscriminatorR(512, 50, 240),
         ])
 
     def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
+        ret_rs = []
+        ret_gs = []
         fmap_rs = []
         fmap_gs = []
-        for i, d in enumerate(self.discriminators):
-            if i != 0:
-                y = self.meanpools[i-1](y)
-                y_hat = self.meanpools[i-1](y_hat)
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
+        for disc in self.discriminators:
+            ret_r, fmap_r = disc(y)
+            ret_g, fmap_g = disc(y_hat)
             fmap_rs.append(fmap_r)
-            y_d_gs.append(y_d_g)
             fmap_gs.append(fmap_g)
+            ret_rs.append(ret_r)
+            ret_gs.append(ret_g)
 
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
-
-
-def feature_loss(fmap_r, fmap_g):
-    loss = 0
-    for dr, dg in zip(fmap_r, fmap_g):
-        for rl, gl in zip(dr, dg):
-            loss += torch.mean(torch.abs(rl - gl))
-
-    return loss*2
-
-
-def discriminator_loss(disc_real_outputs, disc_generated_outputs):
-    loss = 0
-    r_losses = []
-    g_losses = []
-    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1-dr)**2)
-        g_loss = torch.mean(dg**2)
-        loss += (r_loss + g_loss)
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
-
-    return loss, r_losses, g_losses
-
-
-def generator_loss(disc_outputs):
-    loss = 0
-    gen_losses = []
-    for dg in disc_outputs:
-        l = torch.mean((1-dg)**2)
-        gen_losses.append(l)
-        loss += l
-
-    return loss, gen_losses
-
+        return ret_rs, ret_gs, fmap_rs, fmap_gs

@@ -2,6 +2,7 @@ import glob
 import os
 import matplotlib
 import torch
+from torch import nn
 from torch.nn.utils import weight_norm
 matplotlib.use("Agg")
 import matplotlib.pylab as plt
@@ -19,10 +20,10 @@ def plot_spectrogram(spectrogram):
     return fig
 
 
-def init_weights(m, mean=0.0, std=0.01):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        m.weight.data.normal_(mean, std)
+def init_weights(m, std=0.01):
+    if isinstance(m, (nn.Conv1d, nn.Linear)):
+        nn.init.trunc_normal_(m.weight, std)
+        nn.init.constant_(m.bias, 0)
 
 
 def apply_weight_norm(m):
