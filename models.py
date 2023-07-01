@@ -131,7 +131,7 @@ class Generator(torch.nn.Module):
         self.apply(init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed(x)
+        x = self.conv_pre(x)
         x = self.norm(x.transpose(1, 2))
         x = x.transpose(1, 2)
         for conv_block in self.convnext:
