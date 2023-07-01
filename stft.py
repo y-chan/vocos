@@ -59,7 +59,7 @@ class ISTFT(nn.Module):
         B, N, T = spec.shape
 
         # Inverse FFT
-        ifft = self.dft.irdft(spec.real, spec.imag)
+        ifft = self.dft.irdft(spec.real.transpose(1, 2), spec.imag.transpose(1, 2)).transpose(1, 2)
         ifft = ifft * self.window[None, :, None]
 
         # Overlap and Add
