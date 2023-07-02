@@ -29,11 +29,12 @@ class ISTFT(nn.Module):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
+        self.onnx = onnx
         window = torch.hann_window(win_length)
         self.register_buffer("window", window)
-        if padding == "center":
+        if padding == "center" and self.onnx:
             self.istft = _ISTFT(n_fft, hop_length, win_length, window, center=True, onnx=onnx)
-        elif self.padding == "same":
+        elif self.padding == "same" and self.onnx:
             self.dft = DFT(n_fft, None)
 
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
@@ -47,9 +48,11 @@ class ISTFT(nn.Module):
         Returns:
             Tensor: Reconstructed time-domain signal of shape (B, L), where L is the length of the output signal.
         """
-        if self.padding == "center":
-            # Fallback to pytorch native implementation
+        if self.padding == "center" and self.onnx:
             return self.istft(spec.real, spec.imag)
+        elif self.padding == "center":
+            # Fallback to pytorch native implementation
+            return torch.istft(spec, self.n_fft, self.hop_length, self.win_length, self.window, center=True)
         elif self.padding == "same":
             pad = (self.win_length - self.hop_length) // 2
         else:
@@ -59,7 +62,10 @@ class ISTFT(nn.Module):
         B, N, T = spec.shape
 
         # Inverse FFT
-        ifft = self.dft.irdft(spec.real.transpose(1, 2), spec.imag.transpose(1, 2)).transpose(1, 2)
+        if self.onnx:
+            ifft = self.dft.irdft(spec.real.transpose(1, 2), spec.imag.transpose(1, 2)).transpose(1, 2)
+        else:
+            ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
         ifft = ifft * self.window[None, :, None]
 
         # Overlap and Add
